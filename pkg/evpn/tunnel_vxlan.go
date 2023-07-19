@@ -60,43 +60,79 @@ func (s *Server) CreateTunnel(_ context.Context, in *pb.CreateTunnelRequest) (*p
 		return obj, nil
 	}
 	// not found, so create a new one
+	vxlanid := in.Tunnel.Spec.Encap.Value.GetVnid()
+	bridgename := fmt.Sprintf("br%s", vxlanid) // TODO: was resourceID
+	bridge := &netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: bridgename}}
+	if err := netlink.LinkAdd(bridge); err != nil {
+		fmt.Printf("Failed to create link: %v", err)
+		return nil, err
+	}
+	// set MAC on the bridge
+	mac := in.Tunnel.Spec.MacAddress
+	if len(mac) > 0 {
+		if err := netlink.LinkSetHardwareAddr(bridge, mac); err != nil {
+			fmt.Printf("Failed to set MAC on link: %v", err)
+			return nil, err
+		}
+	}
+	// set IPv4 on the bridge
+	if in.Tunnel.Spec.RemoteIp != nil {
+			myip := make(net.IP, 4)
+			binary.BigEndian.PutUint32(myip, in.Tunnel.Spec.RemoteIp.GetV4Addr())
+			addr := &netlink.Addr{IPNet: &net.IPNet{IP: myip}}
+			if err := netlink.AddrAdd(bridge, addr); err != nil {
+					fmt.Printf("Failed to set IP on bridge: %v", err)
+					return nil, err
+			}
+	}
+	// set bridge UP
+	if err := netlink.LinkSetUp(bridge); err != nil {
+		fmt.Printf("Failed to up link: %v", err)
+		return nil, err
+	}
+	// Now create Vxlan
 	myip := make(net.IP, 4)
 	binary.BigEndian.PutUint32(myip, in.Tunnel.Spec.LocalIp.GetV4Addr())
-	vxlanid := in.Tunnel.Spec.Encap.Value.GetVnid()
 	// TODO: take Port from proto instead of hard-coded
 	vxlan := &netlink.Vxlan{LinkAttrs: netlink.LinkAttrs{Name: resourceID}, VxlanId: int(vxlanid), Port: 4789, Learning: false, SrcAddr: myip}
 	if err := netlink.LinkAdd(vxlan); err != nil {
 		fmt.Printf("Failed to create link: %v", err)
 		return nil, err
 	}
-	// TODO: gap... instead of VPC we are looking for Subnet/Bridge here...
+	// add vxlan to the bridge
+	if err := netlink.LinkSetMaster(vxlan, bridge); err != nil {
+		fmt.Printf("Failed to add vxlan to bridge: %v", err)
+		return nil, err
+	}
+	// set vxlan UP
+	if err := netlink.LinkSetUp(vxlan); err != nil {
+		fmt.Printf("Failed to up link: %v", err)
+		return nil, err
+	}
+	// add bridge to VRF
 	if in.Tunnel.Spec.VpcNameRef != "" {
-		// Validate that a Subnet/Bridge resource name conforms to the restrictions outlined in AIP-122.
+		// Validate that a VRF/VPC resource name conforms to the restrictions outlined in AIP-122.
 		if err := resourcename.Validate(in.Tunnel.Spec.VpcNameRef); err != nil {
 			log.Printf("error: %v", err)
 			return nil, err
 		}
-		// now get Subnet/Bridge to plug this vxlan into
-		bridge, ok := s.Subnets[in.Tunnel.Spec.VpcNameRef]
+		// now get VRF/VPC to plug this bridge into
+		vpc, ok := s.Vpcs[in.Tunnel.Spec.VpcNameRef]
 		if !ok {
 			err := status.Errorf(codes.NotFound, "unable to find key %s", in.Tunnel.Spec.VpcNameRef)
 			log.Printf("error: %v", err)
 			return nil, err
 		}
-		brdev, err := netlink.LinkByName(path.Base(bridge.Name))
+		vrf, err := netlink.LinkByName(path.Base(vpc.Name))
 		if err != nil {
-			err := status.Errorf(codes.NotFound, "unable to find key %s", bridge.Name)
+			err := status.Errorf(codes.NotFound, "unable to find key %s", vpc.Name)
 			log.Printf("error: %v", err)
 			return nil, err
 		}
-		if err := netlink.LinkSetMaster(vxlan, brdev); err != nil {
-			fmt.Printf("Failed to add vxlan to bridge: %v", err)
+		if err := netlink.LinkSetMaster(bridge, vrf); err != nil {
+			fmt.Printf("Failed to add bridge to vrf: %v", err)
 			return nil, err
 		}
-	}
-	if err := netlink.LinkSetUp(vxlan); err != nil {
-		fmt.Printf("Failed to up link: %v", err)
-		return nil, err
 	}
 	// TODO: replace cloud -> evpn
 	response := proto.Clone(in.Tunnel).(*pb.Tunnel)
